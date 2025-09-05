@@ -16,7 +16,7 @@ st.set_page_config(page_title="Chart Patterns MVP", layout="wide")
 
 # -------------------- Utilities --------------------
 
-def load_data(ticker: str, tf: str = "1D", period: str = "10y") -> pd.DataFrame:
+def load_data(ticker: str, tf: str = "1D", period: str = "5y") -> pd.DataFrame:
     try:
         if tf == "1D":
             interval = "1d"
@@ -72,14 +72,22 @@ def series_1d(x) -> np.ndarray:
 
 def rolling_max_breakout(df: pd.DataFrame, lookback: int) -> Optional[pd.Timestamp]:
     # Returns the date of a breakout above rolling max (prior N bars)
-    if len(df) < lookback + 2:
+    try:
+        if len(df) < lookback + 2:
+            return None
+        roll = df['Close'].rolling(lookback).max().shift(1)  # prior max
+        cond = df['Close'] > roll
+        # Use explicit boolean check instead of .any() in if condition
+        breakout_exists = cond.sum() > 0  # Count True values
+        if breakout_exists:
+            # Get indices where condition is True
+            true_indices = cond[cond == True].index
+            if len(true_indices) > 0:
+                return true_indices[-1]
         return None
-    roll = df['Close'].rolling(lookback).max().shift(1)  # prior max
-    cond = df['Close'] > roll
-    if cond.any():
-        idx = cond[cond].index[-1]
-        return idx
-    return None
+    except Exception as e:
+        st.warning(f"Error in breakout detection: {str(e)}")
+        return None
 
 def compute_sma(df: pd.DataFrame, length: int) -> pd.Series:
     return df['Close'].rolling(length).mean()
@@ -259,8 +267,8 @@ def detect_cup_handle(df: pd.DataFrame) -> Optional[CupHandle]:
 def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection], ihs: Optional[HSDetection],
                breakout_idx: Optional[pd.Timestamp], cup: Optional[CupHandle]) -> plt.Figure:
     try:
-        df = df.copy()
-        df["SMA200"] = compute_sma(df, 200)
+        df_plot = df.copy()
+        df_plot["SMA200"] = compute_sma(df_plot, 200)
         
         # Create style for mplfinance
         style = mpf.make_mpf_style(
@@ -270,12 +278,12 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
             figcolor='white'
         )
         
-        addp = []
-        if df["SMA200"].notna().any():
-            addp.append(mpf.make_addplot(df["SMA200"], color="#23D5D5", width=1.5))
+        # Limit data to last 800 bars for plotting
+        plot_data = df_plot.tail(800).copy()
         
-        # Use a more compatible approach for plotting
-        plot_data = df.tail(800)
+        addp = []
+        if plot_data["SMA200"].notna().any():
+            addp.append(mpf.make_addplot(plot_data["SMA200"], color="#23D5D5", width=1.5))
         
         fig, axlist = mpf.plot(
             plot_data, 
@@ -289,30 +297,33 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
         )
         ax = axlist[0]
 
-        # map index to integer x for annotation
-        xmap = {d:i for i,d in enumerate(plot_data.index)}
+        # Create mapping between original df indices and plot indices
+        # We need to map from original df to the plot_data slice
+        plot_start_idx = len(df_plot) - len(plot_data)
         
-        def draw_at(i):
-            if i < 0 or i >= len(df): 
+        def draw_at(original_idx):
+            if original_idx < 0 or original_idx >= len(df_plot): 
                 return
-            idx = df.index[i]
-            if idx in xmap:
-                x = xmap[idx]
-                y = df['Close'].iloc[i]
+            # Convert original index to plot index
+            plot_idx = original_idx - plot_start_idx
+            if 0 <= plot_idx < len(plot_data):
+                x = plot_idx
+                y = plot_data['Close'].iloc[plot_idx]
                 if np.isfinite(x) and np.isfinite(y):
-                    circ(ax, x, y, rad=max(8, len(xmap)*0.02))
+                    circ(ax, x, y, rad=max(8, len(plot_data)*0.02))
 
         # H&S
         if hs:
             for i in [hs.left_shoulder, hs.head, hs.right_shoulder, hs.trough_left, hs.trough_right]:
                 draw_at(i)
             x1, x2 = hs.neckline_pts
-            if 0 <= x1 < len(df) and 0 <= x2 < len(df):
-                x1_pos = xmap.get(df.index[x1], None)
-                x2_pos = xmap.get(df.index[x2], None)
-                if x1_pos is not None and x2_pos is not None:
-                    ax.plot([x1_pos, x2_pos],
-                            [df['Close'].iloc[x1], df['Close'].iloc[x2]],
+            if (0 <= x1 < len(df_plot) and 0 <= x2 < len(df_plot) and 
+                x1 >= plot_start_idx and x2 >= plot_start_idx):
+                plot_x1 = x1 - plot_start_idx
+                plot_x2 = x2 - plot_start_idx
+                if 0 <= plot_x1 < len(plot_data) and 0 <= plot_x2 < len(plot_data):
+                    ax.plot([plot_x1, plot_x2],
+                            [plot_data['Close'].iloc[plot_x1], plot_data['Close'].iloc[plot_x2]],
                             linestyle='--', linewidth=2, color='red', alpha=0.6)
 
         # Inverse H&S
@@ -320,17 +331,27 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
             for i in [ihs.left_shoulder, ihs.head, ihs.right_shoulder, ihs.trough_left, ihs.trough_right]:
                 draw_at(i)
             x1, x2 = ihs.neckline_pts
-            if 0 <= x1 < len(df) and 0 <= x2 < len(df):
-                x1_pos = xmap.get(df.index[x1], None)
-                x2_pos = xmap.get(df.index[x2], None)
-                if x1_pos is not None and x2_pos is not None:
-                    ax.plot([x1_pos, x2_pos],
-                            [df['Close'].iloc[x1], df['Close'].iloc[x2]],
+            if (0 <= x1 < len(df_plot) and 0 <= x2 < len(df_plot) and 
+                x1 >= plot_start_idx and x2 >= plot_start_idx):
+                plot_x1 = x1 - plot_start_idx
+                plot_x2 = x2 - plot_start_idx
+                if 0 <= plot_x1 < len(plot_data) and 0 <= plot_x2 < len(plot_data):
+                    ax.plot([plot_x1, plot_x2],
+                            [plot_data['Close'].iloc[plot_x1], plot_data['Close'].iloc[plot_x2]],
                             linestyle='--', linewidth=2, color='green', alpha=0.6)
 
         # Breakout
-        if breakout_idx is not None and breakout_idx in xmap:
-            circ(ax, xmap[breakout_idx], df.loc[breakout_idx,'Close'], rad=max(8, len(xmap)*0.02))
+        if breakout_idx is not None:
+            # Find the breakout index in the original dataframe
+            try:
+                breakout_pos = df_plot.index.get_loc(breakout_idx)
+                if breakout_pos >= plot_start_idx:
+                    plot_breakout_pos = breakout_pos - plot_start_idx
+                    if 0 <= plot_breakout_pos < len(plot_data):
+                        circ(ax, plot_breakout_pos, plot_data['Close'].iloc[plot_breakout_pos], 
+                             rad=max(8, len(plot_data)*0.02))
+            except (KeyError, ValueError):
+                pass  # Breakout not in visible range
 
         # Cup & Handle
         if cup:
@@ -338,12 +359,13 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
                 if i is None or i < 0: 
                     continue
                 draw_at(i)
-            if 0 <= cup.left_rim < len(df) and 0 <= cup.right_rim < len(df):
-                x1_pos = xmap.get(df.index[cup.left_rim], None)
-                x2_pos = xmap.get(df.index[cup.right_rim], None)
-                if x1_pos is not None and x2_pos is not None:
-                    ax.plot([x1_pos, x2_pos],
-                            [df['Close'].iloc[cup.left_rim], df['Close'].iloc[cup.right_rim]],
+            if (0 <= cup.left_rim < len(df_plot) and 0 <= cup.right_rim < len(df_plot) and
+                cup.left_rim >= plot_start_idx and cup.right_rim >= plot_start_idx):
+                plot_x1 = cup.left_rim - plot_start_idx
+                plot_x2 = cup.right_rim - plot_start_idx
+                if 0 <= plot_x1 < len(plot_data) and 0 <= plot_x2 < len(plot_data):
+                    ax.plot([plot_x1, plot_x2],
+                            [plot_data['Close'].iloc[plot_x1], plot_data['Close'].iloc[plot_x2]],
                             linestyle=':', linewidth=1.5, color='gray', alpha=0.8)
 
         return fig
@@ -351,22 +373,38 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
         st.error(f"Error creating chart: {str(e)}")
         # Return a simple fallback plot
         fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(df['Close'].tail(100))
+        df_simple = df.tail(100) if len(df) > 100 else df
+        ax.plot(df_simple['Close'])
         ax.set_title(f"{ticker} - Error in advanced plotting")
         return fig
 
 # -------------------- UI --------------------
 
 st.title("🧪 MVP — Patrones: Diario & Semanal")
-st.caption("Introduce un ticker (ej. AAPL, MSFT, BTC-USD). MVP: H&S, H&S invertido, breakout de máximos (N barras), Cup & Handle (heurístico).")
+st.caption("Introduce un ticker (ej. AAPL, MSFT, BTC-USD). MVP: H&S, H&S invertido, breakout de máximos, Cup & Handle (heurístico).")
 
-col1, col2, col3 = st.columns([2,1,1])
+col1, col2 = st.columns([3,2])
 with col1:
     ticker = st.text_input("Ticker", value="AAPL").strip().upper()
 with col2:
-    lookback_breakout = st.number_input("Breakout: lookback barras", min_value=20, max_value=400, value=252, step=10)
-with col3:
-    period = st.selectbox("Histórico", options=["5y","10y","max"], index=1)
+    period_options = {
+        "3 meses": "3mo",
+        "6 meses": "6mo", 
+        "1 año": "1y",
+        "5 años": "5y"
+    }
+    period_display = st.selectbox("Histórico", options=list(period_options.keys()), index=3)  # Default to 5 años
+    period = period_options[period_display]
+
+# Set lookback based on period for breakout detection
+if period == "3mo":
+    lookback_breakout = 60  # ~3 months of trading days
+elif period == "6mo":
+    lookback_breakout = 120  # ~6 months of trading days
+elif period == "1y":
+    lookback_breakout = 180  # ~9 months (shorter than full year for better signals)
+else:  # 5y
+    lookback_breakout = 252  # 1 year of trading days
 
 if ticker:
     for tf in ["1D","1W"]:
