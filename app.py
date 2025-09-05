@@ -1,5 +1,5 @@
 
-# Streamlit MVP: daily/weekly charts + basic pattern detection (fixed for SciPy 1-D arrays)
+# Streamlit MVP: daily/weekly charts + basic pattern detection (quote-safe)
 # Run: streamlit run app.py
 import streamlit as st
 import pandas as pd
@@ -34,26 +34,18 @@ def smooth(series: pd.Series, window: int = 5) -> pd.Series:
     return series.rolling(window=window, min_periods=1, center=True).mean()
 
 def series_1d(x) -> np.ndarray:
-    \"\"\"Return a clean 1-D float64 numpy array (no NaNs) from Series/DataFrame/ndarray.\"\"\"
-    # Accept pandas objects or numpy arrays
+    # Return a clean 1-D float64 numpy array (no NaNs) from Series/DataFrame/ndarray
     if isinstance(x, pd.DataFrame):
-        # take first column
         arr = x.iloc[:, 0].to_numpy()
     elif isinstance(x, pd.Series):
         arr = x.to_numpy()
     else:
         arr = np.asarray(x)
-
-    # Squeeze any singleton dimensions, e.g., (N,1) -> (N,)
-    arr = np.asarray(arr, dtype="float64").squeeze()
+    arr = np.asarray(arr, dtype="float64")
+    arr = np.squeeze(arr)
     if arr.ndim != 1:
-        # Flatten as last resort
         arr = arr.reshape(-1)
-
-    # Replace NaNs/Infs via forward/back fill using pandas (simplest)
-    s = pd.Series(arr, copy=True)
-    if s.empty:
-        return np.array([], dtype="float64")
+    s = pd.Series(arr, copy=False)
     s = s.replace([np.inf, -np.inf], np.nan)
     s = s.fillna(method="ffill").fillna(method="bfill").fillna(0.0)
     return s.to_numpy()
@@ -90,10 +82,7 @@ class HSDetection:
     confirmed: bool
 
 def detect_head_shoulders(df: pd.DataFrame, inverted: bool = False) -> Optional[HSDetection]:
-    """
-    Heuristic H&S detection using peaks/troughs on smoothed closes.
-    This is intentionally simple for MVP; expect false positives/negatives.
-    """
+    # Heuristic H&S detection using peaks/troughs on smoothed closes
     if 'Close' not in df.columns or len(df) < 20:
         return None
     close = df['Close'].copy()
@@ -126,23 +115,19 @@ def detect_head_shoulders(df: pd.DataFrame, inverted: bool = False) -> Optional[
     for a in range(len(peaks)-2):
         i, j, k = peaks[a], peaks[a+1], peaks[a+2]
         p_i, p_j, p_k = px[i], px[j], px[k]
-        # head highest
         if not (p_j > p_i*(1+min_head_gap) and p_j > p_k*(1+min_head_gap)):
             continue
-        # shoulders similar
         avg_sh = (p_i + p_k) / 2.0
-        if avg_sh == 0: 
+        if avg_sh == 0:
             continue
         if abs(p_i - p_k)/avg_sh > tol_shoulder:
             continue
-        # troughs between i-j and j-k
         left_tr = [t for t in troughs if i < t < j]
         right_tr = [t for t in troughs if j < t < k]
         if not left_tr or not right_tr:
             continue
         tl = min(left_tr, key=lambda t: px[t])
         tr = min(right_tr, key=lambda t: px[t])
-        # neckline
         x1, x2 = tl, tr
         y1, y2 = px[tl], px[tr]
         if x2 == x1:
@@ -150,14 +135,11 @@ def detect_head_shoulders(df: pd.DataFrame, inverted: bool = False) -> Optional[
         slope = (y2 - y1) / (x2 - x1)
         xN = len(df)-1
         yN = y1 + slope*(xN - x1)
-
         last = px[-1]
         confirmed = last < yN if not inverted else last > yN
-
         cand = (j, HSDetection(i, j, k, tl, tr, (tl, tr), confirmed))
         if best is None or cand[0] > best[0]:
             best = cand
-
     if best:
         return best[1]
     return None
@@ -171,12 +153,7 @@ class CupHandle:
     breakout: Optional[int]
 
 def detect_cup_handle(df: pd.DataFrame) -> Optional[CupHandle]:
-    """
-    Very heuristic cup&handle:
-      - Find U-shape: two rims similar height, deep bottom between.
-      - Handle: small pullback after right rim (< 1/3 cup depth).
-      - Breakout: close above right rim high.
-    """
+    # Very heuristic cup&handle
     if 'Close' not in df.columns or len(df) < 50:
         return None
     close = df['Close'].copy()
@@ -184,10 +161,7 @@ def detect_cup_handle(df: pd.DataFrame) -> Optional[CupHandle]:
     n = len(df)
     if n < 50 or not np.isfinite(s).any():
         return None
-    # Work on last ~600 bars
     start_idx = max(0, n-600)
-
-    # Find candidate rims via local maxima
     try:
         prom = float(np.nanmax(s) * 0.005) if np.isfinite(np.nanmax(s)) else 0.0
     except ValueError:
@@ -196,23 +170,20 @@ def detect_cup_handle(df: pd.DataFrame) -> Optional[CupHandle]:
     peaks = [p for p in peaks if p >= start_idx]
     if len(peaks) < 2:
         return None
-
     tol_rim = 0.12
     for a in range(len(peaks)-1):
         L = peaks[a]
         for b in range(a+1, min(a+30, len(peaks))):
             R = peaks[b]
             pL, pR = s[L], s[R]
-            if (pL + pR) == 0: 
+            if (pL + pR) == 0:
                 continue
             if abs(pL - pR)/((pL+pR)/2) > tol_rim:
                 continue
-            # bottom between
             mid = int(np.argmin(s[L:R+1]) + L)
             depth = (max(pL, pR) - s[mid]) / max(1e-9, max(pL, pR))
             if depth < 0.12:
                 continue
-            # handle: small pullback after R
             handle_low = None
             if R+5 < n-1:
                 post = s[R+1: min(R+60, n)]
@@ -223,7 +194,6 @@ def detect_cup_handle(df: pd.DataFrame) -> Optional[CupHandle]:
                     handle_depth = (pR - h_val)/max(1e-9, pR)
                     if 0.02 <= handle_depth <= min(0.35, depth*0.7):
                         handle_low = h_idx
-            # breakout
             breakout = None
             rim_level = max(pL, pR)
             idxs = np.where(df['Close'].values > rim_level)[0]
@@ -249,18 +219,16 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
                            title=f"{ticker} — {'Diario' if tf=='1D' else 'Semanal'}")
     ax = axlist[0]
 
-    # map index to integer x for annotation
     tail = df.tail(800)
     xmap = {d:i for i,d in enumerate(tail.index)}
     def draw_at(i):
-        if i < 0 or i >= len(df): 
+        if i < 0 or i >= len(df):
             return
         idx = df.index[i]
         if idx in xmap:
             x = xmap[idx]; y = df['Close'].iloc[i]
             circ(ax, x, y, rad=max(8, len(xmap)*0.02))
 
-    # H&S
     if hs:
         for i in [hs.left_shoulder, hs.head, hs.right_shoulder, hs.trough_left, hs.trough_right]:
             draw_at(i)
@@ -270,7 +238,6 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
                     [df['Close'].iloc[x1], df['Close'].iloc[x2]],
                     linestyle='--', linewidth=2, color='red', alpha=0.6)
 
-    # Inverse H&S
     if ihs:
         for i in [ihs.left_shoulder, ihs.head, ihs.right_shoulder, ihs.trough_left, ihs.trough_right]:
             draw_at(i)
@@ -280,14 +247,12 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
                     [df['Close'].iloc[x1], df['Close'].iloc[x2]],
                     linestyle='--', linewidth=2, color='green', alpha=0.6)
 
-    # Breakout
     if breakout_idx is not None and breakout_idx in xmap:
         circ(ax, xmap[breakout_idx], df.loc[breakout_idx,'Close'], rad=max(8, len(xmap)*0.02))
 
-    # Cup & Handle
     if cup:
         for i in [cup.left_rim, cup.bottom, cup.right_rim, cup.handle_low or -1, cup.breakout or -1]:
-            if i is None or i < 0: 
+            if i is None or i < 0:
                 continue
             draw_at(i)
         if 0 <= cup.left_rim < len(df) and 0 <= cup.right_rim < len(df):
@@ -316,14 +281,11 @@ if ticker:
         if df.empty:
             st.warning(f"No hay datos para {ticker} en {tf}.")
             continue
-
-        # detecciones
         hs = detect_head_shoulders(df, inverted=False)
         ihs = detect_head_shoulders(df, inverted=True)
         breakout_date = rolling_max_breakout(df, lookback_breakout)
         cup = detect_cup_handle(df)
 
-        # panel de resultados
         flags = []
         if hs: flags.append("Head & Shoulders"+(" ✅ Confirmado" if hs.confirmed else " (setup)"))
         if ihs: flags.append("Inv. Head & Shoulders"+(" ✅ Confirmado" if ihs.confirmed else " (setup)"))
