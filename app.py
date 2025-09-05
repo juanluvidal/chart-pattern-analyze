@@ -34,14 +34,29 @@ def smooth(series: pd.Series, window: int = 5) -> pd.Series:
     return series.rolling(window=window, min_periods=1, center=True).mean()
 
 def series_1d(x) -> np.ndarray:
-    """Ensure a 1-D float64 numpy array without NaNs for SciPy find_peaks."""
-    s = pd.Series(x, copy=True)
-    s = s.astype('float64')
-    s = s.fillna(method='ffill').fillna(method='bfill').fillna(0.0)
-    a = s.to_numpy()
-    if a.ndim != 1:
-        a = a.reshape(-1)
-    return a
+    \"\"\"Return a clean 1-D float64 numpy array (no NaNs) from Series/DataFrame/ndarray.\"\"\"
+    # Accept pandas objects or numpy arrays
+    if isinstance(x, pd.DataFrame):
+        # take first column
+        arr = x.iloc[:, 0].to_numpy()
+    elif isinstance(x, pd.Series):
+        arr = x.to_numpy()
+    else:
+        arr = np.asarray(x)
+
+    # Squeeze any singleton dimensions, e.g., (N,1) -> (N,)
+    arr = np.asarray(arr, dtype="float64").squeeze()
+    if arr.ndim != 1:
+        # Flatten as last resort
+        arr = arr.reshape(-1)
+
+    # Replace NaNs/Infs via forward/back fill using pandas (simplest)
+    s = pd.Series(arr, copy=True)
+    if s.empty:
+        return np.array([], dtype="float64")
+    s = s.replace([np.inf, -np.inf], np.nan)
+    s = s.fillna(method="ffill").fillna(method="bfill").fillna(0.0)
+    return s.to_numpy()
 
 def rolling_max_breakout(df: pd.DataFrame, lookback: int) -> Optional[pd.Timestamp]:
     # Returns the date of a breakout above rolling max (prior N bars)
