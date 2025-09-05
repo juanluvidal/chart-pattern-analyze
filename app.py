@@ -397,7 +397,13 @@ if ticker:
         flags = []
         if hs: flags.append("Head & Shoulders"+(" ✅ Confirmado" if hs.confirmed else " (setup)"))
         if ihs: flags.append("Inv. Head & Shoulders"+(" ✅ Confirmado" if ihs.confirmed else " (setup)"))
-        if breakout_date: flags.append(f"Breakout > max {lookback_breakout} barras")
+        if breakout_date: 
+            days_lookback = lookback_breakout
+            if tf == "1W":
+                days_lookback = f"{lookback_breakout} semanas"
+            else:
+                days_lookback = f"{lookback_breakout} días"
+            flags.append(f"Breakout > máx. {days_lookback}")
         if cup: flags.append("Cup & Handle (heurístico)")
         
         st.subheader(f"{ticker} — {'Diario' if tf=='1D' else 'Semanal'}")
