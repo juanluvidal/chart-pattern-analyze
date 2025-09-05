@@ -1,4 +1,5 @@
-# Streamlit MVP: daily/weekly charts + basic pattern detection
+
+# Streamlit MVP: daily/weekly charts + basic pattern detection (fixed for SciPy 1-D arrays)
 # Run: streamlit run app.py
 import streamlit as st
 import pandas as pd
@@ -8,7 +9,7 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 from scipy.signal import find_peaks
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Optional
 
 st.set_page_config(page_title="Chart Patterns MVP", layout="wide")
 
@@ -31,6 +32,16 @@ def load_data(ticker: str, tf: str = "1D", period: str = "10y") -> pd.DataFrame:
 def smooth(series: pd.Series, window: int = 5) -> pd.Series:
     # simple smoothing for peak detection
     return series.rolling(window=window, min_periods=1, center=True).mean()
+
+def series_1d(x) -> np.ndarray:
+    """Ensure a 1-D float64 numpy array without NaNs for SciPy find_peaks."""
+    s = pd.Series(x, copy=True)
+    s = s.astype('float64')
+    s = s.fillna(method='ffill').fillna(method='bfill').fillna(0.0)
+    a = s.to_numpy()
+    if a.ndim != 1:
+        a = a.reshape(-1)
+    return a
 
 def rolling_max_breakout(df: pd.DataFrame, lookback: int) -> Optional[pd.Timestamp]:
     # Returns the date of a breakout above rolling max (prior N bars)
@@ -60,7 +71,7 @@ class HSDetection:
     right_shoulder: int
     trough_left: int
     trough_right: int
-    neckline_pts: Tuple[int, int]
+    neckline_pts: tuple
     confirmed: bool
 
 def detect_head_shoulders(df: pd.DataFrame, inverted: bool = False) -> Optional[HSDetection]:
@@ -68,14 +79,20 @@ def detect_head_shoulders(df: pd.DataFrame, inverted: bool = False) -> Optional[
     Heuristic H&S detection using peaks/troughs on smoothed closes.
     This is intentionally simple for MVP; expect false positives/negatives.
     """
+    if 'Close' not in df.columns or len(df) < 20:
+        return None
     close = df['Close'].copy()
     if inverted:
         close = -close
 
     s = smooth(close, 7)
-    # find local maxima (peaks) for H&S, minima for inverse (because we inverted, it's still peaks)
-    peaks, _ = find_peaks(s.values, distance=max(5, len(df)//100))
-    troughs, _ = find_peaks((-s).values, distance=max(5, len(df)//100))
+    x = series_1d(s)
+    if x.size < 20:
+        return None
+
+    dist = max(5, len(df)//100) or 5
+    peaks, _ = find_peaks(x, distance=dist)
+    troughs, _ = find_peaks(-x, distance=dist)
     if len(peaks) < 3 or len(troughs) < 2:
         return None
 
@@ -87,7 +104,7 @@ def detect_head_shoulders(df: pd.DataFrame, inverted: bool = False) -> Optional[
         return None
 
     # Find sequence i<j<k peaks s.t. j is head (highest), i and k similar height
-    px = s.values
+    px = x
     best = None
     tol_shoulder = 0.12  # shoulders within 12%
     min_head_gap = 0.03  # head at least 3% higher than shoulders
@@ -103,15 +120,14 @@ def detect_head_shoulders(df: pd.DataFrame, inverted: bool = False) -> Optional[
             continue
         if abs(p_i - p_k)/avg_sh > tol_shoulder:
             continue
-        # locate troughs between i-j and j-k
+        # troughs between i-j and j-k
         left_tr = [t for t in troughs if i < t < j]
         right_tr = [t for t in troughs if j < t < k]
         if not left_tr or not right_tr:
             continue
         tl = min(left_tr, key=lambda t: px[t])
         tr = min(right_tr, key=lambda t: px[t])
-        # neckline coords (tl, tr). Confirmation if price breaks below (or above for inverted)
-        # Estimate neckline level at last bar by linear interpolation
+        # neckline
         x1, x2 = tl, tr
         y1, y2 = px[tl], px[tr]
         if x2 == x1:
@@ -146,40 +162,48 @@ def detect_cup_handle(df: pd.DataFrame) -> Optional[CupHandle]:
       - Handle: small pullback after right rim (< 1/3 cup depth).
       - Breakout: close above right rim high.
     """
+    if 'Close' not in df.columns or len(df) < 50:
+        return None
     close = df['Close'].copy()
-    s = smooth(close, 7).values
+    s = series_1d(smooth(close, 7))
     n = len(df)
+    if n < 50 or not np.isfinite(s).any():
+        return None
     # Work on last ~600 bars
     start_idx = max(0, n-600)
-    x = np.arange(n)
 
     # Find candidate rims via local maxima
-    peaks, _ = find_peaks(s, distance=10, prominence=np.nanmax(s)*0.005)
+    try:
+        prom = float(np.nanmax(s) * 0.005) if np.isfinite(np.nanmax(s)) else 0.0
+    except ValueError:
+        prom = 0.0
+    peaks, _ = find_peaks(s, distance=10, prominence=prom)
     peaks = [p for p in peaks if p >= start_idx]
     if len(peaks) < 2:
         return None
 
-    # Try pairs of peaks (left<right)
     tol_rim = 0.12
     for a in range(len(peaks)-1):
         L = peaks[a]
         for b in range(a+1, min(a+30, len(peaks))):
             R = peaks[b]
             pL, pR = s[L], s[R]
+            if (pL + pR) == 0: 
+                continue
             if abs(pL - pR)/((pL+pR)/2) > tol_rim:
                 continue
             # bottom between
-            mid = np.argmin(s[L:R+1]) + L
+            mid = int(np.argmin(s[L:R+1]) + L)
             depth = (max(pL, pR) - s[mid]) / max(1e-9, max(pL, pR))
-            if depth < 0.12:  # at least 12% deep
+            if depth < 0.12:
                 continue
             # handle: small pullback after R
             handle_low = None
             if R+5 < n-1:
                 post = s[R+1: min(R+60, n)]
-                if len(post) > 0:
-                    h_idx_rel = np.argmin(post)
-                    h_val = post[h_idx_rel]
+                if post.size > 0:
+                    h_idx_rel = int(np.argmin(post))
+                    h_val = float(post[h_idx_rel])
                     h_idx = R+1+h_idx_rel
                     handle_depth = (pR - h_val)/max(1e-9, pR)
                     if 0.02 <= handle_depth <= min(0.35, depth*0.7):
@@ -187,11 +211,10 @@ def detect_cup_handle(df: pd.DataFrame) -> Optional[CupHandle]:
             # breakout
             breakout = None
             rim_level = max(pL, pR)
-            # last close above rim?
-            last_break = np.where(close.values > rim_level)[0]
-            last_break = last_break[last_break > R]
-            if last_break.size > 0:
-                breakout = int(last_break[-1])
+            idxs = np.where(df['Close'].values > rim_level)[0]
+            idxs = idxs[idxs > R]
+            if idxs.size > 0:
+                breakout = int(idxs[-1])
             return CupHandle(L, mid, R, handle_low, breakout)
     return None
 
@@ -212,9 +235,11 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
     ax = axlist[0]
 
     # map index to integer x for annotation
-    xmap = {d:i for i,d in enumerate(df.tail(800).index)}
-    # helper to draw circle at index
-    def draw_at(i, color='red'):
+    tail = df.tail(800)
+    xmap = {d:i for i,d in enumerate(tail.index)}
+    def draw_at(i):
+        if i < 0 or i >= len(df): 
+            return
         idx = df.index[i]
         if idx in xmap:
             x = xmap[idx]; y = df['Close'].iloc[i]
@@ -223,26 +248,24 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
     # H&S
     if hs:
         for i in [hs.left_shoulder, hs.head, hs.right_shoulder, hs.trough_left, hs.trough_right]:
-            if 0 <= i < len(df):
-                draw_at(i)
-        # neckline
+            draw_at(i)
         x1, x2 = hs.neckline_pts
         if 0 <= x1 < len(df) and 0 <= x2 < len(df):
-            ax.plot([xmap[df.index[x1]], xmap[df.index[x2]]],
+            ax.plot([xmap.get(df.index[x1], None), xmap.get(df.index[x2], None)],
                     [df['Close'].iloc[x1], df['Close'].iloc[x2]],
                     linestyle='--', linewidth=2, color='red', alpha=0.6)
+
     # Inverse H&S
     if ihs:
         for i in [ihs.left_shoulder, ihs.head, ihs.right_shoulder, ihs.trough_left, ihs.trough_right]:
-            if 0 <= i < len(df):
-                draw_at(i)
+            draw_at(i)
         x1, x2 = ihs.neckline_pts
         if 0 <= x1 < len(df) and 0 <= x2 < len(df):
-            ax.plot([xmap[df.index[x1]], xmap[df.index[x2]]],
+            ax.plot([xmap.get(df.index[x1], None), xmap.get(df.index[x2], None)],
                     [df['Close'].iloc[x1], df['Close'].iloc[x2]],
                     linestyle='--', linewidth=2, color='green', alpha=0.6)
 
-    # Breakout 52w (or N)
+    # Breakout
     if breakout_idx is not None and breakout_idx in xmap:
         circ(ax, xmap[breakout_idx], df.loc[breakout_idx,'Close'], rad=max(8, len(xmap)*0.02))
 
@@ -251,10 +274,9 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
         for i in [cup.left_rim, cup.bottom, cup.right_rim, cup.handle_low or -1, cup.breakout or -1]:
             if i is None or i < 0: 
                 continue
-            if 0 <= i < len(df): draw_at(i)
-        # draw cup rims line
+            draw_at(i)
         if 0 <= cup.left_rim < len(df) and 0 <= cup.right_rim < len(df):
-            ax.plot([xmap[df.index[cup.left_rim]], xmap[df.index[cup.right_rim]]],
+            ax.plot([xmap.get(df.index[cup.left_rim], None), xmap.get(df.index[cup.right_rim], None)],
                     [df['Close'].iloc[cup.left_rim], df['Close'].iloc[cup.right_rim]],
                     linestyle=':', linewidth=1.5, color='gray', alpha=0.8)
 
@@ -263,7 +285,7 @@ def plot_chart(df: pd.DataFrame, ticker: str, tf: str, hs: Optional[HSDetection]
 # -------------------- UI --------------------
 
 st.title("🧪 MVP — Patrones: Diario & Semanal")
-st.caption("Introduce un ticker (ej. AAPL, MSFT, BTC-USD). Este MVP detecta H&S, H&S invertido, breakout de máximos (N barras) y Cup & Handle (heurístico).")
+st.caption("Introduce un ticker (ej. AAPL, MSFT, BTC-USD). MVP: H&S, H&S invertido, breakout de máximos (N barras), Cup & Handle (heurístico).")
 
 col1, col2, col3 = st.columns([2,1,1])
 with col1:
